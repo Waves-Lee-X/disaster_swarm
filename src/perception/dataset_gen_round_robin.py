@@ -8,14 +8,13 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import List, Tuple
-from sklearn.cluster import KMeans
 
 # ===============================
 # 基本配置
 # ===============================
 DRONES = ["Drone1", "Drone2", "Drone3", "Drone4", "Drone5"]
 
-MAP_AREA = [-20.0, 20.0, -20.0, 20.0, 0, 20.0]  # x,y 正常，z 用正数表示高度（米）
+MAP_AREA = [-20.0, 20.0, -20.0, 20.0, 0, 20.0]
 
 Z_LAYERS_LOW  = [0, 5.0]
 Z_LAYERS_MID  = [5.0, 15.0]
@@ -63,9 +62,6 @@ log = logging.getLogger("dataset_gen")
 def ts() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
-def to_ned_z(z_positive: float) -> float:
-    return -abs(z_positive)
-
 def boustrophedon_points_for_area(area: List[float],
                                   z_layers: List[float],
                                   step: float) -> List[Tuple[float,float,float]]:
@@ -86,12 +82,10 @@ def boustrophedon_points_for_area(area: List[float],
             reverse = not reverse
     return points
 
-def cluster_partition(points: List[Tuple[float,float,float]], num_drones: int) -> List[List[Tuple[float,float,float]]]:
-    coords = np.array([(x, y) for x, y, _ in points])
-    kmeans = KMeans(n_clusters=num_drones, random_state=42).fit(coords)
+def distribute_points(points: List[Tuple[float,float,float]], num_drones: int) -> List[List[Tuple[float,float,float]]]:
     buckets = [[] for _ in range(num_drones)]
-    for p, label in zip(points, kmeans.labels_):
-        buckets[label].append(p)
+    for i, p in enumerate(points):
+        buckets[i % num_drones].append(p)
     return buckets
 
 def set_camera_pose(client: airsim.MultirotorClient, drone: str, pitch_deg: float, yaw_deg: float):
@@ -153,7 +147,7 @@ def drone_worker(drone: str, points: List[Tuple[float,float,float]]):
     client.armDisarm(True, drone)
 
     client.takeoffAsync(vehicle_name=drone).join()
-    client.moveToZAsync(to_ned_z(SAFE_TAKEOFF_Z), CRUISE_VELOCITY, vehicle_name=drone).join()
+    client.moveToZAsync(float(SAFE_TAKEOFF_Z), CRUISE_VELOCITY, vehicle_name=drone).join()
 
     captured_sets = 0
     skipped_points = 0
@@ -165,7 +159,7 @@ def drone_worker(drone: str, points: List[Tuple[float,float,float]]):
 
             log.info(f"[{drone}] wp#{i} -> target=({x:.1f},{y:.1f},{z:.1f})")
 
-            client.moveToPositionAsync(float(x), float(y), to_ned_z(z),
+            client.moveToPositionAsync(float(x), float(y), float(z),
                                        CRUISE_VELOCITY, vehicle_name=drone)
 
             while True:
@@ -175,7 +169,7 @@ def drone_worker(drone: str, points: List[Tuple[float,float,float]]):
                 vel = state.kinematics_estimated.linear_velocity
                 speed = np.linalg.norm([vel.x_val, vel.y_val, vel.z_val])
 
-                if abs(pos.x_val - x) < 1.0 and abs(pos.y_val - y) < 1.0 and abs(pos.z_val - to_ned_z(z)) < 1.0:
+                if abs(pos.x_val - x) < 1.0 and abs(pos.y_val - y) < 1.0 and abs(pos.z_val - z) < 1.0:
                     log.info(f"[{drone}] wp#{i} reached.")
                     break
 
@@ -183,14 +177,16 @@ def drone_worker(drone: str, points: List[Tuple[float,float,float]]):
                     if stall_t0 is None:
                         stall_t0 = time.time()
                     elif time.time() - stall_t0 > MAX_STALL_TIME:
-                        log.warning(f"[{drone}] wp#{i} stalled {MAX_STALL_TIME}s, skipping...")
+                        log.warning(f"[{drone}] wp#{i} stalled, capturing and skipping...")
+                        capture_at_waypoint(client, drone, f"{i:05d}_stalled")
                         skipped_points += 1
                         break
                 else:
                     stall_t0 = None
 
                 if time.time() - t0 > WAYPOINT_TIMEOUT:
-                    log.warning(f"[{drone}] wp#{i} timeout, skipping...")
+                    log.warning(f"[{drone}] wp#{i} timeout, capturing and skipping...")
+                    capture_at_waypoint(client, drone, f"{i:05d}_timeout")
                     skipped_points += 1
                     break
 
@@ -220,7 +216,7 @@ def main():
     all_points = boustrophedon_points_for_area(MAP_AREA, Z_LAYERS, XY_STEP)
     log.info(f"[assign] total waypoints={len(all_points)}")
 
-    buckets = cluster_partition(all_points, len(DRONES))
+    buckets = distribute_points(all_points, len(DRONES))
     for dn, pts in zip(DRONES, buckets):
         log.info(f"[assign] {dn} -> {len(pts)} pts")
 
@@ -234,15 +230,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
 
 
